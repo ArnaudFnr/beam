@@ -17,10 +17,7 @@
  */
 package org.apache.beam.sdk.extensions.sketching;
 
-import com.clearspring.analytics.stream.frequency.CountMinSketch;
-import com.clearspring.analytics.stream.frequency.FrequencyMergeException;
 import com.google.auto.value.AutoValue;
-import com.google.common.hash.Hashing;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -44,6 +41,8 @@ import org.apache.beam.sdk.transforms.display.DisplayData;
 import org.apache.beam.sdk.util.CoderUtils;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
+import org.apache.spark.util.sketch.CountMinSketch;
+import org.apache.spark.util.sketch.IncompatibleMergeException;
 
 /**
  * {@code PTransform}s to compute the estimate frequency of each element in a stream.
@@ -317,26 +316,26 @@ public final class SketchFrequencies {
     private final double epsilon;
     private final double confidence;
 
-    private CountMinSketchFn(final Coder<InputT> coder, double eps, double confidence) {
+    private CountMinSketchFn(final Coder<InputT> inputCoder, double eps, double confidence) {
       this.epsilon = eps;
       this.confidence = confidence;
       this.width = (int) Math.ceil(2 / eps);
       this.depth = (int) Math.ceil(-Math.log(1 - confidence) / Math.log(2));
-      this.inputCoder = coder;
+      this.inputCoder = inputCoder;
     }
 
     /**
      * Returns an {@link CountMinSketchFn} combiner with the given input coder.
      *
-     * @param coder the coder that encodes the elements' type
+     * @param inputCoder the coder that encodes the elements' type
      */
-    public static <InputT> CountMinSketchFn<InputT>create(Coder<InputT> coder) {
+    public static <InputT> CountMinSketchFn<InputT>create(final Coder<InputT> inputCoder) {
       try {
-        coder.verifyDeterministic();
+        inputCoder.verifyDeterministic();
       } catch (Coder.NonDeterministicException e) {
         throw new IllegalArgumentException("Coder is not deterministic ! " + e.getMessage(), e);
       }
-      return new CountMinSketchFn<>(coder, 0.01, 0.999);
+      return new CountMinSketchFn<>(inputCoder, 0.01, 0.999);
     }
 
     /**
@@ -350,7 +349,7 @@ public final class SketchFrequencies {
      * @param confidence the confidence in the result to not exceed the relative error
      */
     public CountMinSketchFn<InputT> withAccuracy(double epsilon, double confidence) {
-      return new CountMinSketchFn<InputT>(this.inputCoder, epsilon, confidence);
+      return new CountMinSketchFn<InputT>(inputCoder, epsilon, confidence);
     }
 
     @Override public Sketch<InputT> createAccumulator() {
@@ -369,9 +368,9 @@ public final class SketchFrequencies {
       CountMinSketch mergedSketches = first.sketch;
       try {
         while (it.hasNext()) {
-          mergedSketches = CountMinSketch.merge(mergedSketches, it.next().sketch);
+          mergedSketches = mergedSketches.mergeInPlace(it.next().sketch);
         }
-      } catch (FrequencyMergeException e) {
+      } catch (IncompatibleMergeException e) {
         // Should never happen because every instantiated accumulator are of the same type.
         throw new IllegalStateException("The accumulators cannot be merged !" + e.getMessage());
       }
@@ -411,16 +410,17 @@ public final class SketchFrequencies {
    */
   public static class Sketch<T> implements Serializable {
 
-    static final int SEED = 123456;
+    static final int SEED = 13579;
 
     int width;
     int depth;
     CountMinSketch sketch;
+    Coder<T> coder;
 
     public Sketch(double eps, double confidence) {
       this.width = (int) Math.ceil(2 / eps);
       this.depth = (int) Math.ceil(-Math.log(1 - confidence) / Math.log(2));
-      sketch = new CountMinSketch(width, depth, SEED);
+      sketch = CountMinSketch.create(width, depth, SEED);
     }
 
     private Sketch(int width, int depth, CountMinSketch sketch) {
@@ -429,19 +429,30 @@ public final class SketchFrequencies {
       this.depth = depth;
     }
 
-    public void add(T element, Coder<T> coder) {
-      sketch.add(hashElement(element, coder), 1L);
+    public void add(T element, long count) {
+      sketch.add(encodeElement(element, coder), count);
     }
 
-    private long hashElement(T element, Coder<T> coder) {
+    public void add(T element, Coder<T> coder) {
+      sketch.add(encodeElement(element, coder), 1L);
+    }
+
+    public void add(T element, long count, Coder<T> coder) {
+      sketch.add(encodeElement(element, coder), count);
+    }
+
+    private byte[] encodeElement(T element, Coder<T> coder) {
       try {
-        byte[] elemBytes = CoderUtils.encodeToByteArray(coder, element);
-        return Hashing.murmur3_128().hashBytes(elemBytes).asLong();
+        return CoderUtils.encodeToByteArray(coder, element);
       } catch (CoderException e) {
-        throw new IllegalStateException("The input value cannot be encoded: " + e.getMessage(), e);
+        throw new IllegalStateException("The input value cannot be encoded: " + element.toString()
+                + "\nCause: " + e.getMessage(), e);
       }
     }
 
+    public void setCoder(Coder<T> coder) {
+      this.coder = coder;
+    }
     public int getWidth() {
       return this.width;
     }
@@ -455,7 +466,15 @@ public final class SketchFrequencies {
      * CountMinSketch}.
      */
     public long estimateCount(T element, Coder<T> coder) {
-      return sketch.estimateCount(hashElement(element, coder));
+      return sketch.estimateCount(encodeElement(element, coder));
+    }
+
+    /**
+     * Utility class to retrieve the estimate frequency of an element from a {@link
+     * CountMinSketch}.
+     */
+    public long estimateCount(T element) {
+      return sketch.estimateCount(encodeElement(element, coder));
     }
 
     @Override
@@ -495,15 +514,14 @@ public final class SketchFrequencies {
       }
       INT_CODER.encode(value.width, outStream);
       INT_CODER.encode(value.depth, outStream);
-      BYTE_ARRAY_CODER.encode(CountMinSketch.serialize(value.sketch), outStream);
+      value.sketch.writeTo(outStream);
     }
 
     @Override
     public Sketch<T> decode(InputStream inStream) throws IOException {
       int width = INT_CODER.decode(inStream);
       int depth = INT_CODER.decode(inStream);
-      byte[] sketchBytes = BYTE_ARRAY_CODER.decode(inStream);
-      CountMinSketch sketch = CountMinSketch.deserialize(sketchBytes);
+      CountMinSketch sketch = CountMinSketch.readFrom(inStream);
       return new Sketch<T>(width, depth, sketch);
     }
 
@@ -517,11 +535,12 @@ public final class SketchFrequencies {
       if (value == null) {
         throw new CoderException("cannot encode a null Count-min Sketch");
       } else {
-        // 8L is for the sketch's size (long)
-        // 4L * 2 is for depth and width (ints) in Sketch<T> and in the Count-Min sketch
+        // 4L for the version number (int)
+        // 8L is for the sketch total count (long)
+        // 4L * 4 is for depth and width (ints) in Sketch<T> and in the Count-Min sketch
         // 8L * depth * (width + 1) is a factorization for the sizes of table (long[depth][width])
         // and hashA (long[depth])
-        return 8L + 4L * 4 + 8L * value.depth * (value.width + 1);
+        return 4L + 8L + 4L * 4 + 8L * value.depth * (value.width + 1);
       }
     }
   }

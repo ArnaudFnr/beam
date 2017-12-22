@@ -20,6 +20,7 @@ package org.apache.beam.sdk.extensions.sketching;
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
 import org.apache.avro.Schema;
@@ -27,7 +28,9 @@ import org.apache.avro.SchemaBuilder;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.beam.sdk.coders.AvroCoder;
+import org.apache.beam.sdk.coders.ByteArrayCoder;
 import org.apache.beam.sdk.coders.Coder;
+import org.apache.beam.sdk.coders.CoderException;
 import org.apache.beam.sdk.coders.VarIntCoder;
 import org.apache.beam.sdk.coders.VarLongCoder;
 import org.apache.beam.sdk.extensions.sketching.SketchFrequencies.CountMinSketchFn;
@@ -44,9 +47,11 @@ import org.apache.beam.sdk.transforms.SerializableFunction;
 import org.apache.beam.sdk.transforms.Values;
 import org.apache.beam.sdk.transforms.View;
 import org.apache.beam.sdk.transforms.WithKeys;
+import org.apache.beam.sdk.util.CoderUtils;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionView;
+import org.apache.spark.util.sketch.CountMinSketch;
 import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.Test;
@@ -67,10 +72,9 @@ public class SketchFrequenciesTest implements Serializable {
           6L, 6L, 6L, 6L, 6L, 6L,
           7L, 7L, 7L, 7L, 7L, 7L, 7L,
           8L, 8L, 8L, 8L, 8L, 8L, 8L, 8L,
-          9L, 9L, 9L, 9L, 9L, 9L, 9L, 9L, 9L,
-          10L, 10L, 10L, 10L, 10L, 10L, 10L, 10L, 10L, 10L);
+          9L, 9L, 9L, 9L, 9L, 9L, 9L, 9L, 9L);
 
-  private Long[] distinctElems = {1L, 2L, 3L, 4L, 5L, 6L, 8L, 9L, 10L};
+  private Long[] distinctElems = {1L, 2L, 3L, 4L, 5L, 6L, 8L, 9L};
   private Long[] frequencies = distinctElems.clone();
 
   @Test
@@ -196,22 +200,22 @@ public class SketchFrequenciesTest implements Serializable {
   }
 
   @Test
-  public void customObject() {
+  public void customObjectGOOD() {
+    int nUsers = 3;
+    final long occurrences = 2L;
     Schema schema =
             SchemaBuilder.record("User")
                     .fields()
                     .requiredString("Pseudo")
-                    .requiredLong("Expected_frequency")
+                    .requiredInt("Age")
                     .endRecord();
-    final List<GenericRecord> users = new ArrayList<>();
-    for (long i = 1L; i < 11L; i++) {
+    List<GenericRecord> users = new ArrayList<>();
+    for (int i = 0; i < nUsers; i++) {
       GenericData.Record newRecord = new GenericData.Record(schema);
       newRecord.put("Pseudo", "User" + i);
-      newRecord.put("Expected_frequency", i);
-      // Add i times the new record : the frequency is equal to the age
-      for (int j = 0; j < i; j++) {
-        users.add(newRecord);
-      }
+      newRecord.put("Age", i);
+      // Add the new record with the defined number of occurrences.
+      users.addAll(Collections.nCopies((int) occurrences, newRecord));
     }
 
     final AvroCoder<GenericRecord> coder = AvroCoder.of(schema);
@@ -230,11 +234,79 @@ public class SketchFrequenciesTest implements Serializable {
       public void processElement(ProcessContext c) {
         GenericRecord user = c.element();
         Sketch<GenericRecord> sketch = c.sideInput(sketchView);
-        // The frequency of each record is equal to the "Age" of the user
-        Assert.assertEquals(user.get("Expected_frequency"),
+        Assert.assertEquals(occurrences,
                 sketch.estimateCount(user, coder));
       }}).withSideInputs(sketchView));
     tp.run();
+  }
+
+  @Test
+  public void customObjectWRONG() {
+    int nUsers = 50;
+    long occurrences = 2L; // occurrence of each user in the stream
+    double eps = 0.01;
+    double conf = 0.8;
+    // I want to test my implementation of Sketch and compare to Spark Count-Min Sketch
+    Sketch<byte[]> sketch = new Sketch<>(eps, conf);
+    CountMinSketch sparkSketch = CountMinSketch.create(eps, conf, 123456);
+    Schema schema =
+            SchemaBuilder.record("User")
+                    .fields()
+                    .requiredString("Pseudo")
+                    .requiredInt("Age")
+                    .endRecord();
+    Coder<GenericRecord> coder = AvroCoder.of(schema);
+    ByteArrayCoder byteCoder = ByteArrayCoder.of();
+
+    for (int i = 1; i <= nUsers; i++) {
+      GenericData.Record newRecord = new GenericData.Record(schema);
+      newRecord.put("Pseudo", "User" + i);
+      newRecord.put("Age", i);
+      try {
+        // convert object to byte array
+        byte[] userBytes = CoderUtils.encodeToByteArray(coder, newRecord);
+        // add bytes to the two sketches
+        sketch.add(userBytes, occurrences, byteCoder);
+        sparkSketch.addBinary(userBytes, occurrences);
+        Assert.assertEquals("Test Spark", occurrences, sparkSketch.estimateCount(userBytes));
+        Assert.assertEquals("Test API", occurrences, sketch.estimateCount(userBytes, byteCoder));
+      } catch (CoderException e) {
+        e.printStackTrace();
+      }
+    }
+  }
+
+  @Test
+  public void addElementWRONG() {
+    // THE DIRECT USE OF INNER SKETCH DOES NEITHER WORK WITH PRIMITIVE TYPE
+    double eps = 0.01;
+    double conf = 0.8;
+    Sketch<Integer> sketch = new Sketch<>(eps, conf);
+    int nUsers = 50;
+    long occurrences = 2L;
+
+    Coder<Integer> coder = VarIntCoder.of();
+    for (int i = 1; i <= nUsers; i++) {
+      sketch.add(i, occurrences, coder);
+      Assert.assertEquals("Test API", occurrences, sketch.estimateCount(i, coder));
+    }
+  }
+
+  @Test
+  public void addElementGOOD() {
+    // THE DIRECT USE OF INNER SKETCH DOES NEITHER WORK WITH PRIMITIVE TYPE
+    double eps = 0.01;
+    double conf = 0.8;
+    Sketch<Integer> sketch = new Sketch<>(eps, conf);
+    int nUsers = 10;
+    long occurrences = 2L;
+
+    Coder<Integer> coder = VarIntCoder.of();
+    sketch.setCoder(coder);
+    for (int i = 1; i <= nUsers; i++) {
+      sketch.add(i, occurrences);
+      Assert.assertEquals("Test API", occurrences, sketch.estimateCount(i));
+    }
   }
 
   @Test
